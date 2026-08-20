@@ -423,7 +423,7 @@
         <input type="text" placeholder="Search employees, tasks, activities...">
       </div>
       <div class="top-r">
-        <div class="cloudst" title="Xaaladda cloud"><span class="cdot" id="cloudDot"></span><span id="cloudTxt">Cloud</span></div>
+        <div class="cloudst" title="Riix si aad u soo dejiso xogta cloud-ka" style="cursor:pointer" onclick="cloudPull()"><span class="cdot" id="cloudDot"></span><span id="cloudTxt">Cloud</span></div>
         <div class="bell" onclick="openNotifications()"><svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg><span class="bdg" id="bellBadge">5</span></div>
         <div class="top-u"><div class="av">SA</div>
           <div><div class="nm">System Administrator</div><div class="rl">Administrator</div></div>
@@ -799,31 +799,52 @@ function seedUsers(){
 
 // ---- STORE ----
 var DB=null;
-// ===== SUPABASE CLOUD SYNC =====
-var SB_URL='https://dslpzpbasrfyproeusvl.supabase.co';
-var SB_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRzbHB6cGJhc3JmeXByb2V1c3ZsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMyMzc2MDUsImV4cCI6MjA5ODgxMzYwNX0.4DbHXrpvbHW-jHKe-sHIqN4jfDIr9TOpdXm9udlIryY';
+// ===== CLOUD SYNC (via Cloudflare Worker proxy) =====
+// SB_KEY-gii hore waa laga saaray client-ka. Hadda dhammaan waxay maraan Worker proxy.
+// 1) Geli URL-ka Worker-kaaga hoos. 2) APP_SECRET waa in uu la mid noqdo kan Cloudflare loo dejiyay.
+var PROXY_URL='https://dayaxjet-proxy.dahabo4466219.workers.dev'; // <-- Worker-kaaga dayaxjet-proxy
+var APP_SECRET='dayax2026xyz';                              // <-- la mid ah APP_SECRET-ka Worker-ka
 var SB_WS='dayaxjet';
 var cloudTimer=null;
-function sbHeaders(){ return {'apikey':SB_KEY,'Authorization':'Bearer '+SB_KEY,'Content-Type':'application/json'}; }
+var CLOUD_UPDATED=null; // waqtiga ugu dambeeyay ee cloud-ka la og yahay
+function cloudReady(){ return PROXY_URL && PROXY_URL.indexOf('BEDDEL')<0 && APP_SECRET!=='CHANGE_ME_SET_IN_CLOUDFLARE'; }
+function proxyHeaders(){ return {'Content-Type':'application/json','x-app-secret':APP_SECRET}; }
 function setCloud(state){
   var dot=document.getElementById('cloudDot'), txt=document.getElementById('cloudTxt');
   var m={saving:['#f59e0b','Kaydinaya…'],ok:['#15864f','Cloud'],err:['#ef4444','Offline'],load:['#2563eb','Soo dejinaya…']};
   var s=m[state]||m.ok; if(dot) dot.style.background=s[0]; if(txt) txt.textContent=s[1];
 }
 function cloudSave(){
+  if(!cloudReady()){ setCloud('err'); return; }
   if(cloudTimer) clearTimeout(cloudTimer);
   cloudTimer=setTimeout(function(){
     setCloud('saving');
-    fetch(SB_URL+'/rest/v1/dj_state',{method:'POST',headers:Object.assign(sbHeaders(),{'Prefer':'resolution=merge-duplicates,return=minimal'}),body:JSON.stringify({workspace:SB_WS,data:DB,updated_at:new Date().toISOString()})})
-      .then(function(r){ setCloud(r.ok?'ok':'err'); }).catch(function(){ setCloud('err'); });
+    var stamp=new Date().toISOString();
+    fetch(PROXY_URL,{method:'POST',headers:proxyHeaders(),body:JSON.stringify({workspace:SB_WS,data:DB,updated_at:stamp})})
+      .then(function(r){ if(r.ok){ CLOUD_UPDATED=stamp; setCloud('ok'); } else setCloud('err'); })
+      .catch(function(){ setCloud('err'); });
   },800);
 }
 function cloudLoad(cb){
-  fetch(SB_URL+'/rest/v1/dj_state?workspace=eq.'+SB_WS+'&select=data',{headers:sbHeaders()})
+  if(!cloudReady()){ cb(undefined); return; }
+  fetch(PROXY_URL+'?workspace='+encodeURIComponent(SB_WS),{headers:proxyHeaders()})
     .then(function(r){ if(!r.ok) throw 0; return r.json(); })
-    .then(function(rows){ cb(rows&&rows.length?rows[0].data:null); })
+    .then(function(row){ if(row&&row.data){ CLOUD_UPDATED=row.updated_at||null; cb(row.data); } else cb(null); })
     .catch(function(){ cb(undefined); });
 }
+// Riix badhinka Cloud si aad gacan ugu soo dejiso xogta ugu dambeysay (conflict resolution fudud)
+function cloudPull(){
+  if(!cloudReady()){ setCloud('err'); return; }
+  setCloud('load');
+  cloudLoad(function(data){
+    if(data){ DB=data; migrateDB(); saveLocal(); loadSession();
+      if(CURRENT){ refresh(); setPage(PAGE); }
+      setCloud('ok'); if(typeof toast==='function') toast('Cloud-ka laga soo dejiyay xogta cusub'); }
+    else if(data===null){ setCloud('ok'); }
+    else setCloud('err');
+  });
+}
+window.cloudPull=cloudPull;
 function migrateDB(){
   var changed=false;
   if(!DB.users){ DB.users=seedUsers(); changed=true; }
@@ -2195,6 +2216,21 @@ try{
   var bl=new Blob([JSON.stringify(mf)],{type:"application/json"});
   var lk=document.createElement('link'); lk.rel='manifest'; lk.href=URL.createObjectURL(bl); document.head.appendChild(lk);
 }catch(e){}
+
+// ---- SERVICE WORKER (offline + auto-update) ----
+// Waxay u baahan tahay faylka 'sw.js' oo isku galka ah app-ka (isku folder).
+if('serviceWorker' in navigator){
+  try{
+    navigator.serviceWorker.register('sw.js').then(function(reg){
+      reg.addEventListener('updatefound',function(){
+        var nw=reg.installing;
+        if(nw){ nw.addEventListener('statechange',function(){
+          if(nw.state==='installed' && navigator.serviceWorker.controller && typeof toast==='function'){ toast('Nooc cusub ayaa diyaar ah — dib u fur app-ka'); }
+        }); }
+      });
+    }).catch(function(){});
+  }catch(e){}
+}
 
 // ---- INIT ----
 window.onload=function(){
